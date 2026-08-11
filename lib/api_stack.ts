@@ -2,7 +2,11 @@ import * as cdk from "aws-cdk-lib";
 import * as apigateway from "aws-cdk-lib/aws-apigateway";
 import * as cognito from "aws-cdk-lib/aws-cognito";
 import * as lambda from "aws-cdk-lib/aws-lambda";
+import * as eventsources from "aws-cdk-lib/aws-lambda-event-sources";
 import * as nodejs from "aws-cdk-lib/aws-lambda-nodejs";
+import * as sns from "aws-cdk-lib/aws-sns";
+import * as subs from "aws-cdk-lib/aws-sns-subscriptions";
+import * as sqs from "aws-cdk-lib/aws-sqs";
 import * as ssm from "aws-cdk-lib/aws-ssm";
 import * as path from "path";
 import { Construct } from "constructs";
@@ -65,6 +69,40 @@ export class ApiStack extends cdk.Stack {
 
 		neonParam.grantRead(workoutsLambda);
 		neonParam.grantRead(statsLambda);
+
+		// ── SQS & SNS Infrastructure ──────────────────────────────────────────────
+		const dlq = new sqs.Queue(this, "WorkoutDLQ", {
+			queueName: "workout-events-dlq",
+			retentionPeriod: cdk.Duration.days(14),
+		});
+
+		const workoutQueue = new sqs.Queue(this, "WorkoutQueue", {
+			queueName: "workout-events-queue",
+			visibilityTimeout: cdk.Duration.seconds(30), // Must be >= Lambda timeout (10s)
+			deadLetterQueue: {
+				queue: dlq,
+				maxReceiveCount: 3,
+			},
+		});
+
+		const workoutTopic = new sns.Topic(this, "WorkoutTopic", {
+			topicName: "workout-events-topic",
+		});
+
+		workoutTopic.addSubscription(
+			new subs.SqsSubscription(workoutQueue, {
+				rawMessageDelivery: true,
+			})
+		);
+
+		workoutTopic.grantPublish(workoutsLambda);
+		workoutsLambda.addEventSource(
+			new eventsources.SqsEventSource(workoutQueue, {
+				batchSize: 10,
+			})
+		);
+
+		workoutsLambda.addEnvironment("WORKOUT_TOPIC_ARN", workoutTopic.topicArn);
 
 		// ── Cognito authorizer ────────────────────────────────────────────────────
 		const authorizer = new apigateway.CognitoUserPoolsAuthorizer(
@@ -160,6 +198,18 @@ export class ApiStack extends cdk.Stack {
 			value: api.url,
 			description: "Base URL — prefix all API calls with this",
 			exportName: "WorkoutApiUrl",
+		});
+
+		new cdk.CfnOutput(this, "TopicArn", {
+			value: workoutTopic.topicArn,
+			description: "SNS Topic ARN for workout events",
+			exportName: "WorkoutTopicArn",
+		});
+
+		new cdk.CfnOutput(this, "QueueUrl", {
+			value: workoutQueue.queueUrl,
+			description: "SQS Queue URL for workout events",
+			exportName: "WorkoutQueueUrl",
 		});
 	}
 }

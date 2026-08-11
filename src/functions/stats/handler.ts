@@ -104,7 +104,7 @@ async function getSummary(sub: string) {
 		);
 
 	// Current streak: consecutive days with at least one workout, counting back from today
-	const [{ streak }] = await db.execute<{ streak: number }>(sql`
+	const streakResult = await db.execute<{ streak: number }>(sql`
     WITH daily AS (
       SELECT DISTINCT w.performed_on::date AS day
       FROM workout w
@@ -126,6 +126,8 @@ async function getSummary(sub: string) {
     FROM streak_check
     WHERE day = expected
   `);
+
+	const streak = streakResult.rows[0]?.streak ?? 0;
 
 	return ok({ totalWorkouts, totalVolumeKg: Number(totalVolumeKg), currentStreak: Number(streak) });
 }
