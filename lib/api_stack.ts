@@ -12,204 +12,226 @@ import * as path from "path";
 import { Construct } from "constructs";
 
 interface ApiStackProps extends cdk.StackProps {
-	userPool: cognito.UserPool;
+  userPool: cognito.UserPool;
 }
 
 export class ApiStack extends cdk.Stack {
-	constructor(scope: Construct, id: string, props: ApiStackProps) {
-		super(scope, id, props);
+  constructor(scope: Construct, id: string, props: ApiStackProps) {
+    super(scope, id, props);
 
-		// ── SSM Parameter Store (free) ────────────────────────────────────────────
-		// Create manually in the AWS Console:
-		//   Parameter name: /workout/neon-connection-string
-		//   Type: SecureString
-		//   Value: your Neon DATABASE_URL
-		const neonParam = ssm.StringParameter.fromSecureStringParameterAttributes(
-			this,
-			"NeonParam",
-			{ parameterName: "/workout/neon-connection-string" }
-		);
+    // ── SSM Parameter Store (free) ────────────────────────────────────────────
+    // Create manually in the AWS Console:
+    //   Parameter name: /workout/neon-connection-string
+    //   Type: SecureString
+    //   Value: your Neon DATABASE_URL
+    const neonParam = ssm.StringParameter.fromSecureStringParameterAttributes(
+      this,
+      "NeonParam",
+      { parameterName: "/workout/neon-connection-string" },
+    );
 
-		// ── Shared Lambda config ──────────────────────────────────────────────────
-		const sharedProps: Partial<nodejs.NodejsFunctionProps> = {
-			runtime: lambda.Runtime.NODEJS_20_X,
-			architecture: lambda.Architecture.ARM_64, // Graviton — cheaper + faster
-			timeout: cdk.Duration.seconds(10),
-			memorySize: 256,
-			bundling: {
-				minify: true,
-				sourceMap: true,
-				target: "node20",
-				externalModules: [], // bundle everything — no Lambda layers needed
-			},
-			environment: {
-				NODE_ENV: "production",
-				NEON_SSM_PARAM: "/workout/neon-connection-string",
-			},
-		};
+    // ── Shared Lambda config ──────────────────────────────────────────────────
+    const sharedProps: Partial<nodejs.NodejsFunctionProps> = {
+      runtime: lambda.Runtime.NODEJS_20_X,
+      architecture: lambda.Architecture.ARM_64, // Graviton — cheaper + faster
+      timeout: cdk.Duration.seconds(10),
+      memorySize: 256,
+      bundling: {
+        minify: true,
+        sourceMap: true,
+        target: "node20",
+        externalModules: [], // bundle everything — no Lambda layers needed
+      },
+      environment: {
+        NODE_ENV: "production",
+        NEON_SSM_PARAM: "/workout/neon-connection-string",
+      },
+    };
 
-		// ── Lambda: workout service ───────────────────────────────────────────────
-		const workoutsLambda = new nodejs.NodejsFunction(this, "WorkoutsLambda", {
-			...sharedProps,
-			functionName: "workout-service",
-			entry: path.join(__dirname, "../src/functions/workouts/handler.ts"),
-			description: "CRUD — workouts, workout-exercises, entries, climbing routes",
-		});
+    // ── Lambda: workout service (HTTP) ────────────────────────────────────────
+    const workoutsLambda = new nodejs.NodejsFunction(this, "WorkoutsLambda", {
+      ...sharedProps,
+      functionName: "workout-service",
+      entry: path.join(__dirname, "../src/functions/workouts/handler.ts"),
+      description:
+        "CRUD HTTP — workouts, workout-exercises, entries, climbing routes",
+    });
 
-		// ── Lambda: stats service ─────────────────────────────────────────────────
-		const statsLambda = new nodejs.NodejsFunction(this, "StatsLambda", {
-			...sharedProps,
-			functionName: "stats-service",
-			entry: path.join(__dirname, "../src/functions/stats/handler.ts"),
-			description: "Aggregations — summary, frequency, exercise progression",
-			// Stats queries are heavier — give them more headroom
-			timeout: cdk.Duration.seconds(15),
-			memorySize: 512,
-		});
+    // ── Lambda: workout worker service (SQS) ──────────────────────────────────
+    const workoutWorkerLambda = new nodejs.NodejsFunction(
+      this,
+      "WorkoutWorkerLambda",
+      {
+        ...sharedProps,
+        functionName: "workout-events-worker",
+        entry: path.join(__dirname, "../src/functions/workouts/worker.ts"),
+        description: "Asynchronous worker consuming workout-events queue",
+        timeout: cdk.Duration.seconds(20), // Must be <= visibilityTimeout (30s)
+      },
+    );
 
-		neonParam.grantRead(workoutsLambda);
-		neonParam.grantRead(statsLambda);
+    // ── Lambda: stats service ─────────────────────────────────────────────────
+    const statsLambda = new nodejs.NodejsFunction(this, "StatsLambda", {
+      ...sharedProps,
+      functionName: "stats-service",
+      entry: path.join(__dirname, "../src/functions/stats/handler.ts"),
+      description: "Aggregations — summary, frequency, exercise progression",
+      // Stats queries are heavier — give them more headroom
+      timeout: cdk.Duration.seconds(15),
+      memorySize: 512,
+    });
 
-		// ── SQS & SNS Infrastructure ──────────────────────────────────────────────
-		const dlq = new sqs.Queue(this, "WorkoutDLQ", {
-			queueName: "workout-events-dlq",
-			retentionPeriod: cdk.Duration.days(14),
-		});
+    neonParam.grantRead(workoutsLambda);
+    neonParam.grantRead(workoutWorkerLambda);
+    neonParam.grantRead(statsLambda);
 
-		const workoutQueue = new sqs.Queue(this, "WorkoutQueue", {
-			queueName: "workout-events-queue",
-			visibilityTimeout: cdk.Duration.seconds(30), // Must be >= Lambda timeout (10s)
-			deadLetterQueue: {
-				queue: dlq,
-				maxReceiveCount: 3,
-			},
-		});
+    // ── SQS & SNS Infrastructure ──────────────────────────────────────────────
+    const dlq = new sqs.Queue(this, "WorkoutDLQ", {
+      queueName: "workout-events-dlq",
+      retentionPeriod: cdk.Duration.days(14),
+    });
 
-		const workoutTopic = new sns.Topic(this, "WorkoutTopic", {
-			topicName: "workout-events-topic",
-		});
+    const workoutQueue = new sqs.Queue(this, "WorkoutQueue", {
+      queueName: "workout-events-queue",
+      visibilityTimeout: cdk.Duration.seconds(30), // Must be >= Lambda timeout (20s)
+      deadLetterQueue: {
+        queue: dlq,
+        maxReceiveCount: 3,
+      },
+    });
 
-		workoutTopic.addSubscription(
-			new subs.SqsSubscription(workoutQueue, {
-				rawMessageDelivery: true,
-			})
-		);
+    const workoutTopic = new sns.Topic(this, "WorkoutTopic", {
+      topicName: "workout-events-topic",
+    });
 
-		workoutTopic.grantPublish(workoutsLambda);
-		workoutsLambda.addEventSource(
-			new eventsources.SqsEventSource(workoutQueue, {
-				batchSize: 10,
-			})
-		);
+    workoutTopic.addSubscription(
+      new subs.SqsSubscription(workoutQueue, {
+        rawMessageDelivery: true,
+      }),
+    );
 
-		workoutsLambda.addEnvironment("WORKOUT_TOPIC_ARN", workoutTopic.topicArn);
+    workoutTopic.grantPublish(workoutsLambda);
+    workoutWorkerLambda.addEventSource(
+      new eventsources.SqsEventSource(workoutQueue, {
+        batchSize: 10,
+        reportBatchItemFailures: true,
+      }),
+    );
 
-		// ── Cognito authorizer ────────────────────────────────────────────────────
-		const authorizer = new apigateway.CognitoUserPoolsAuthorizer(
-			this,
-			"CognitoAuthorizer",
-			{
-				cognitoUserPools: [props.userPool],
-				authorizerName: "WorkoutCognitoAuthorizer",
-				resultsCacheTtl: cdk.Duration.minutes(5),
-			}
-		);
+    workoutsLambda.addEnvironment("WORKOUT_TOPIC_ARN", workoutTopic.topicArn);
 
-		const protected_ = {
-			authorizer,
-			authorizationType: apigateway.AuthorizationType.COGNITO,
-		};
+    // ── Cognito authorizer ────────────────────────────────────────────────────
+    const authorizer = new apigateway.CognitoUserPoolsAuthorizer(
+      this,
+      "CognitoAuthorizer",
+      {
+        cognitoUserPools: [props.userPool],
+        authorizerName: "WorkoutCognitoAuthorizer",
+        resultsCacheTtl: cdk.Duration.minutes(5),
+      },
+    );
 
-		// ── API Gateway ───────────────────────────────────────────────────────────
-		const api = new apigateway.RestApi(this, "WorkoutApi", {
-			restApiName: "workout-api",
+    const protected_ = {
+      authorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    };
 
-			defaultCorsPreflightOptions: {
-				allowOrigins: apigateway.Cors.ALL_ORIGINS, // tighten in prod
-				allowMethods: apigateway.Cors.ALL_METHODS,
-				allowHeaders: ["Content-Type", "Authorization", "X-Amz-Date"],
-			},
+    // ── API Gateway ───────────────────────────────────────────────────────────
+    const api = new apigateway.RestApi(this, "WorkoutApi", {
+      restApiName: "workout-api",
 
-			deployOptions: {
-				stageName: "v1",
-				loggingLevel: apigateway.MethodLoggingLevel.INFO,
-				metricsEnabled: true,
-				dataTraceEnabled: false, // flip to true temporarily when debugging
-			},
-		});
+      defaultCorsPreflightOptions: {
+        allowOrigins: apigateway.Cors.ALL_ORIGINS, // tighten in prod
+        allowMethods: apigateway.Cors.ALL_METHODS,
+        allowHeaders: ["Content-Type", "Authorization", "X-Amz-Date"],
+      },
 
-		const workoutsInt = new apigateway.LambdaIntegration(workoutsLambda, { proxy: true });
-		const statsInt = new apigateway.LambdaIntegration(statsLambda, { proxy: true });
+      deployOptions: {
+        stageName: "v1",
+        loggingLevel: apigateway.MethodLoggingLevel.INFO,
+        metricsEnabled: true,
+        dataTraceEnabled: false, // flip to true temporarily when debugging
+      },
+    });
 
-		// ── /users/me — upserts the user row in Neon on first login ────────────────
-		const users = api.root.addResource("users");
-		users.addResource("me").addMethod("POST", workoutsInt, protected_);
+    const workoutsInt = new apigateway.LambdaIntegration(workoutsLambda, {
+      proxy: true,
+    });
+    const statsInt = new apigateway.LambdaIntegration(statsLambda, {
+      proxy: true,
+    });
 
-		// ── /exercises (public) ───────────────────────────────────────────────────
-		const exercises = api.root.addResource("exercises");
-		exercises.addMethod("GET", workoutsInt);
-		exercises.addResource("{exerciseId}").addMethod("GET", workoutsInt);
+    // ── /users/me — upserts the user row in Neon on first login ────────────────
+    const users = api.root.addResource("users");
+    users.addResource("me").addMethod("POST", workoutsInt, protected_);
 
-		// ── /workouts ─────────────────────────────────────────────────────────────
-		const workouts = api.root.addResource("workouts");
-		workouts.addMethod("GET", workoutsInt, protected_);
-		workouts.addMethod("POST", workoutsInt, protected_);
+    // ── /exercises (public) ───────────────────────────────────────────────────
+    const exercises = api.root.addResource("exercises");
+    exercises.addMethod("GET", workoutsInt);
+    exercises.addResource("{exerciseId}").addMethod("GET", workoutsInt);
 
-		const workoutById = workouts.addResource("{workoutId}");
-		workoutById.addMethod("GET", workoutsInt, protected_);
-		workoutById.addMethod("PATCH", workoutsInt, protected_);
-		workoutById.addMethod("DELETE", workoutsInt, protected_);
+    // ── /workouts ─────────────────────────────────────────────────────────────
+    const workouts = api.root.addResource("workouts");
+    workouts.addMethod("GET", workoutsInt, protected_);
+    workouts.addMethod("POST", workoutsInt, protected_);
 
-		// ── /workouts/{workoutId}/exercises ───────────────────────────────────────
-		const weList = workoutById.addResource("exercises");
-		weList.addMethod("POST", workoutsInt, protected_);
+    const workoutById = workouts.addResource("{workoutId}");
+    workoutById.addMethod("GET", workoutsInt, protected_);
+    workoutById.addMethod("PATCH", workoutsInt, protected_);
+    workoutById.addMethod("DELETE", workoutsInt, protected_);
 
-		const weById = weList.addResource("{weId}");
-		weById.addMethod("PATCH", workoutsInt, protected_);
-		weById.addMethod("DELETE", workoutsInt, protected_);
+    // ── /workouts/{workoutId}/exercises ───────────────────────────────────────
+    const weList = workoutById.addResource("exercises");
+    weList.addMethod("POST", workoutsInt, protected_);
 
-		// ── /workouts/{workoutId}/exercises/{weId}/entries ────────────────────────
-		const entries = weById.addResource("entries");
-		entries.addMethod("POST", workoutsInt, protected_);
+    const weById = weList.addResource("{weId}");
+    weById.addMethod("PATCH", workoutsInt, protected_);
+    weById.addMethod("DELETE", workoutsInt, protected_);
 
-		const entryById = entries.addResource("{entryId}");
-		entryById.addMethod("PATCH", workoutsInt, protected_);
-		entryById.addMethod("DELETE", workoutsInt, protected_);
+    // ── /workouts/{workoutId}/exercises/{weId}/entries ────────────────────────
+    const entries = weById.addResource("entries");
+    entries.addMethod("POST", workoutsInt, protected_);
 
-		// ── /workouts/{workoutId}/exercises/{weId}/routes ─────────────────────────
-		const routes = weById.addResource("routes");
-		routes.addMethod("POST", workoutsInt, protected_);
+    const entryById = entries.addResource("{entryId}");
+    entryById.addMethod("PATCH", workoutsInt, protected_);
+    entryById.addMethod("DELETE", workoutsInt, protected_);
 
-		const routeById = routes.addResource("{routeId}");
-		routeById.addMethod("PATCH", workoutsInt, protected_);
-		routeById.addMethod("DELETE", workoutsInt, protected_);
+    // ── /workouts/{workoutId}/exercises/{weId}/routes ─────────────────────────
+    const routes = weById.addResource("routes");
+    routes.addMethod("POST", workoutsInt, protected_);
 
-		// ── /stats ────────────────────────────────────────────────────────────────
-		const stats = api.root.addResource("stats");
+    const routeById = routes.addResource("{routeId}");
+    routeById.addMethod("PATCH", workoutsInt, protected_);
+    routeById.addMethod("DELETE", workoutsInt, protected_);
 
-		stats.addResource("summary").addMethod("GET", statsInt, protected_);
-		stats.addResource("frequency").addMethod("GET", statsInt, protected_);
+    // ── /stats ────────────────────────────────────────────────────────────────
+    const stats = api.root.addResource("stats");
 
-		const statsExercises = stats.addResource("exercises");
-		statsExercises.addResource("{exerciseId}").addMethod("GET", statsInt, protected_);
+    stats.addResource("summary").addMethod("GET", statsInt, protected_);
+    stats.addResource("frequency").addMethod("GET", statsInt, protected_);
 
-		// ── Outputs ───────────────────────────────────────────────────────────────
-		new cdk.CfnOutput(this, "ApiUrl", {
-			value: api.url,
-			description: "Base URL — prefix all API calls with this",
-			exportName: "WorkoutApiUrl",
-		});
+    const statsExercises = stats.addResource("exercises");
+    statsExercises
+      .addResource("{exerciseId}")
+      .addMethod("GET", statsInt, protected_);
 
-		new cdk.CfnOutput(this, "TopicArn", {
-			value: workoutTopic.topicArn,
-			description: "SNS Topic ARN for workout events",
-			exportName: "WorkoutTopicArn",
-		});
+    // ── Outputs ───────────────────────────────────────────────────────────────
+    new cdk.CfnOutput(this, "ApiUrl", {
+      value: api.url,
+      description: "Base URL — prefix all API calls with this",
+      exportName: "WorkoutApiUrl",
+    });
 
-		new cdk.CfnOutput(this, "QueueUrl", {
-			value: workoutQueue.queueUrl,
-			description: "SQS Queue URL for workout events",
-			exportName: "WorkoutQueueUrl",
-		});
-	}
+    new cdk.CfnOutput(this, "TopicArn", {
+      value: workoutTopic.topicArn,
+      description: "SNS Topic ARN for workout events",
+      exportName: "WorkoutTopicArn",
+    });
+
+    new cdk.CfnOutput(this, "QueueUrl", {
+      value: workoutQueue.queueUrl,
+      description: "SQS Queue URL for workout events",
+      exportName: "WorkoutQueueUrl",
+    });
+  }
 }
